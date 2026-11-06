@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""cco: Claude Code orchestrator for tmux.
+
+  cco ls                         live tmux sessions, their Claude session, account, status
+  cco switch SESS... --to ACCT   move Claude sessions to another account, same conversation
+  cco save                       snapshot all tmux sessions (cron runs this)
+  cco restore [-n]               recreate missing tmux sessions + resume Claude after a reboot
+
+Accounts are Claude config dirs, set in ~/.config/cco/accounts.json
+(default: {"claude": "~/.claude", "claude2": "~/.claude-ecos"}).
+"""
+
+import argparse
+import calendar
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONF = HOME / ".config/cco/accounts.json"
+STATE = HOME / ".local/state/cco/state.json"
+DEFAULT_ACCOUNTS = {"claude": "~/.claude", "claude2": "~/.claude-ecos"}
+DEFAULT_DIR = (HOME / ".claude").resolve()
+
+
+def boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def accounts():
+    raw = json.loads(CONF.read_text()) if CONF.exists() else DEFAULT_ACCOUNTS
+    return {name: Path(os.path.expanduser(d)).resolve() for name, d in raw.items()}
+
+
+def account_of(cfg_dir):
+    for name, d in accounts().items():
+        if d == cfg_dir:
+            return name
+    return str(cfg_dir)
+
+
+def tmux(*args, check=True):
+    r = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    if check and r.returncode:
+        sys.exit(f"tmux {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def proc(pid, what):
+    try:
+        return (Path("/proc") / str(pid) / what).read_bytes()
+    except OSError:
+        return b""
+
+
+def children(pid):
+    out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout
+    return [int(p) for p in out.split()]
+
+
+def claude_pid(pane_pid):
+    """First descendant of the pane shell whose argv[0] is claude."""
+    todo = [pane_pid]
+    while todo:
+        pid = todo.pop(0)
+        argv = proc(pid, "cmdline").split(b"\0")
+        if argv and os.path.basename(argv[0].decode()) == "claude":
+            return pid
+        todo += children(pid)
+    return None
+
+
+def config_dir(pid):
+    for kv in proc(pid, "environ").split(b"\0"):
+        if kv.startswith(b"CLAUDE_CONFIG_DIR="):
+            return Path(os.path.expanduser(kv.split(b"=", 1)[1].decode())).resolve()
+    return DEFAULT_DIR
+
+
+def strip_resume(argv):
+    """Claude args minus the ones that pick a session; we add --resume ID ourselves."""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a in ("--resume", "-r", "--session-id"):
+            skip = True
+        elif a in ("--continue", "-c") or a.startswith(("--resume=", "--session-id=")):
+            pass
+        else:
+            out.append(a)
+    return out
+
+
+def panes():
+    """One dict per tmux pane, with Claude info when a Claude runs in it."""
+    fmt = "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_path}"
+    r = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt], capture_output=True, text=True)
+    if r.returncode:  # no tmux server
+        return []
+    rows = []
+    for line in r.stdout.splitlines():
+        sess, win, pane, pane_id, pane_pid, cwd = line.split("\t")
+        row = dict(session=sess, window=int(win), pane=int(pane), pane_id=pane_id,
+                   cwd=cwd, claude=None)
+        pid = claude_pid(int(pane_pid))
+        if pid:
+            cfg = config_dir(pid)
+            reg_file = cfg / "sessions" / f"{pid}.json"
+            reg = json.loads(reg_file.read_text()) if reg_file.exists() else {}
+            argv = [a.decode() for a in proc(pid, "cmdline").split(b"\0")[1:] if a]
+            row["claude"] = dict(pid=pid, account=account_of(cfg), config_dir=str(cfg),
+                                 session_id=reg.get("sessionId"), cwd=reg.get("cwd", cwd),
+                                 name=reg.get("name"), status=reg.get("status"),
+                                 started_at=reg.get("startedAt", 0),
+                                 args=strip_resume(argv))
+            row["cwd"] = row["claude"]["cwd"]
+        rows.append(row)
+    return rows
+
+
+def transcript(cfg_dir, sid):
+    hits = list((Path(cfg_dir) / "projects").glob(f"*/{sid}.jsonl")) if sid else []
+    return hits[0] if hits else None
+
+
+def limit_reset(c):
+    """Epoch when this Claude's account limit resets, if its transcript shows a usage-limit error
+    from this process (older errors came from another account before a switch)."""
+    path = transcript(c["config_dir"], c["session_id"])
+    if not path:
+        return None
+    with open(path, "rb") as f:
+        f.seek(max(0, path.stat().st_size - 4_000_000))
+        lines = f.read().splitlines()
+    for line in reversed(lines):
+        if b'"rate_limit"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("error") != "rate_limit":
+            continue
+        ts = calendar.timegm(time.strptime(d["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))
+        reset = (d.get("quotaLimits") or {}).get("resetsAt")
+        if ts * 1000 >= c["started_at"] and reset and reset > time.time():
+            return reset
+        return None
+    return None
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(STATE)
+
+
+def account_limits(rows):
+    """account -> reset epoch, for accounts that hit their usage limit. Remembered in the state
+    file, so an account stays flagged after its sessions moved away or exited."""
+    state = load_state()
+    out = {a: t for a, t in state.get("limits", {}).items() if t > time.time()}
+    for r in rows:
+        c = r["claude"]
+        if c and (reset := limit_reset(c)):
+            out[c["account"]] = max(reset, out.get(c["account"], 0))
+    if out != state.get("limits"):
+        write_state({**state, "limits": out})
+    return out
+
+
+def launch_cmd(cfg_dir, session_id, args):
+    cfg = Path(cfg_dir)
+    env = "env -u CLAUDE_CONFIG_DIR" if cfg == DEFAULT_DIR else f"CLAUDE_CONFIG_DIR={shlex.quote(str(cfg))}"
+    return " ".join([env, "claude", *(["--resume", session_id] if session_id else []),
+                     *map(shlex.quote, args)])
+
+
+# ---------------------------------------------------------------- ls
+
+def cmd_ls(a):
+    rows = panes()
+    if not rows:
+        print("no tmux server running")
+        return
+    limits = account_limits(rows)
+    for acct, reset in limits.items():
+        print(f"{acct}: usage limit until {time.strftime('%a %d %b %H:%M', time.localtime(reset))}")
+    for r in rows:
+        c = r["claude"]
+        where = f'{r["session"]}:{r["window"]}.{r["pane"]}'
+        if not c:
+            print(f"{where:<16} {'-':<8} {'(shell)':<38} {r['cwd']}")
+            continue
+        flag = "LIMIT" if c["account"] in limits else (c["status"] or "?")
+        print(f"{where:<16} {c['account']:<8} {str(c['session_id']):<38} {flag:<8} "
+              f"{c['name'] or '':<22} {c['cwd']}")
+
+
+# ---------------------------------------------------------------- switch
+
+def copy_session(src, dst, sid):
+    """Copy a conversation's files from one config dir to another. Returns what was copied."""
+    hits = list((src / "projects").glob(f"*/{sid}.jsonl"))
+    if not hits:
+        sys.exit(f"transcript {sid}.jsonl not found under {src}/projects")
+    copied = []
+    for jsonl in hits:
+        proj = dst / "projects" / jsonl.parent.name
+        proj.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(jsonl, proj / jsonl.name)
+        copied.append(proj / jsonl.name)
+        side = jsonl.with_suffix("")  # <id>/ holds subagents and tool-results
+        if side.is_dir():
+            shutil.copytree(side, proj / sid, dirs_exist_ok=True)
+    # per-session state stored next to projects: file-history/<id>, session-env/<id>, todos/<id>-*...
+    for top in src.iterdir():
+        if top.is_dir() and top.name not in ("projects", "sessions"):
+            for item in top.glob(f"{sid}*"):
+                target = dst / top.name / item.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if item.is_dir():
+                    shutil.copytree(item, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, target)
+                copied.append(target)
+    return copied
+
+
+def stop(pid, pane_id):
+    os.kill(pid, signal.SIGTERM)
+    for i in range(100):
+        if not Path(f"/proc/{pid}").exists():
+            break
+        if i == 50:
+            os.kill(pid, signal.SIGKILL)
+        time.sleep(0.1)
+    else:
+        sys.exit(f"pid {pid} would not exit")
+    time.sleep(0.5)
+    tmux("send-keys", "-t", pane_id, "C-u")  # clear any half-typed line in the shell
+
+
+def trusted(cfg_dir, cwd):
+    """Did this account accept the trust dialog for cwd or a parent? (config dir ~/.claude -> ~/.claude.json)"""
+    cfg = Path(cfg_dir)
+    f = HOME / ".claude.json" if cfg == DEFAULT_DIR else cfg / ".claude.json"
+    try:
+        projects = json.loads(f.read_text()).get("projects", {})
+    except (OSError, ValueError):
+        return False
+    p = Path(cwd)
+    return any(projects.get(str(q), {}).get("hasTrustDialogAccepted") for q in [p, *p.parents])
+
+
+def wait_started(pane_id, trust_ok, timeout=90):
+    """Answer startup dialogs, return the new Claude's registry entry once its prompt is up."""
+    shell = int(tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}").strip())
+    end, quiet = time.time() + timeout, 0
+    while time.time() < end:
+        time.sleep(1)
+        screen = tmux("capture-pane", "-p", "-t", pane_id, check=False)
+        if "Yes, I trust this folder" in screen:
+            if not trust_ok:
+                print("  folder-trust dialog is waiting for you (the old account never trusted this folder)")
+                return None
+            tmux("send-keys", "-t", pane_id, "Down")
+            tmux("send-keys", "-t", pane_id, "Enter")
+            print("  accepted folder trust (the old account had trusted it)")
+            quiet = 0
+            continue
+        if "Resume this conversation?" in screen:
+            tmux("send-keys", "-t", pane_id, "Enter")  # default option is "Resume"
+            quiet = 0
+            continue
+        pid = claude_pid(shell)
+        reg = pid and config_dir(pid) / "sessions" / f"{pid}.json"
+        quiet = quiet + 1 if reg and reg.exists() else 0
+        if quiet >= 3:  # registered and no dialog for 3s
+            return json.loads(reg.read_text())
+    return None
+
+
+def cmd_switch(a):
+    accts = accounts()
+    if a.to not in accts:
+        sys.exit(f"unknown account {a.to}; known: {', '.join(accts)}")
+    dst = accts[a.to]
+    rows = [r for r in panes() if r["claude"]]
+    targets = rows if a.limited else [r for r in rows if r["session"] in a.sessions]
+    limits = account_limits(rows)
+    if a.limited:
+        targets = [r for r in targets if r["claude"]["account"] in limits]
+    missing = set(a.sessions) - {r["session"] for r in targets}
+    if missing:
+        sys.exit(f"no Claude running in tmux session(s): {', '.join(sorted(missing))}")
+    if not targets:
+        print("nothing to switch")
+    me, pid = set(), os.getpid()
+    while pid > 1:  # never kill the Claude that runs cco
+        me.add(pid)
+        pid = int(proc(pid, "stat").rsplit(b")", 1)[1].split()[1] or 1)
+    for r in targets:
+        c, name = r["claude"], r["session"]
+        if c["pid"] in me:
+            print(f"{name}: skipped, that's this session")
+            continue
+        if c["account"] == a.to:
+            print(f"{name}: already on {a.to}")
+            continue
+        if not c["session_id"]:
+            print(f"{name}: skipped, no session id in {c['config_dir']}/sessions/{c['pid']}.json")
+            continue
+        if c["status"] in ("busy", "shell") and not a.force:
+            print(f"{name}: skipped, status {c['status']}: a turn or command is running (--force interrupts it)")
+            continue
+        sid, cmd = c["session_id"], launch_cmd(dst, c["session_id"], c["args"])
+        print(f"{name}: {c['account']} -> {a.to}  session {sid}")
+        if a.dry_run:
+            print(f"  would copy from {c['config_dir']} and run: {cmd}")
+            continue
+        stop(c["pid"], r["pane_id"])
+        copied = copy_session(Path(c["config_dir"]), dst, sid)
+        print(f"  copied {len(copied)} items to {dst}")
+        tmux("send-keys", "-t", r["pane_id"], "-l", cmd)
+        tmux("send-keys", "-t", r["pane_id"], "Enter")
+        reg = wait_started(r["pane_id"], trusted(c["config_dir"], c["cwd"]))
+        if not reg:
+            print(f"  WARNING: not up yet; check `tmux attach -t {name}`")
+            continue
+        if reg.get("sessionId") != sid:
+            print(f"  WARNING: resumed as {reg.get('sessionId')}, expected {sid}")
+        print(f"  resumed (pid {reg['pid']})")
+        if a.say:
+            tmux("send-keys", "-t", r["pane_id"], "-l", a.say)
+            tmux("send-keys", "-t", r["pane_id"], "Enter")
+            print(f"  sent: {a.say}")
+    cmd_save(argparse.Namespace(quiet=True))
+
+
+# ---------------------------------------------------------------- save / restore
+
+def cmd_save(a):
+    state = load_state()
+    if state.get("entries") and state.get("boot_id") != boot_id():
+        # Rebooted and not restored yet: saving now would overwrite the snapshot with whatever
+        # little runs so far. `cco restore` adopts the new boot.
+        if not a.quiet:
+            print("snapshot is from before the last reboot; run `cco restore` first")
+        return
+    rows = panes()
+    if not rows:  # tmux down: keep the last good snapshot
+        if not a.quiet:
+            print("no tmux server; state left as is")
+        return
+    entries = []
+    for r in rows:
+        if r["pane"] != 0:  # cco restores one pane per window
+            continue
+        c = r["claude"]
+        entries.append(dict(session=r["session"], window=r["window"], cwd=r["cwd"],
+                            claude=None if not c else dict(
+                                config_dir=c["config_dir"], account=c["account"],
+                                session_id=c["session_id"], name=c["name"], args=c["args"])))
+    write_state({**load_state(), "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                 "boot_id": boot_id(), "entries": entries})
+    if not a.quiet:
+        print(f"saved {len(entries)} windows to {STATE}")
+
+
+def cmd_restore(a):
+    state = load_state()
+    if "entries" not in state:
+        sys.exit(f"no snapshot at {STATE}")
+    print(f"snapshot from {state['saved_at']}")
+    live = {(r["session"], r["window"]) for r in panes()}
+    live_sessions = {s for s, _ in live}
+    for e in state["entries"]:
+        if (e["session"], e["window"]) in live:
+            continue
+        c, where = e["claude"], f'{e["session"]}:{e["window"]}'
+        cmd = launch_cmd(c["config_dir"], c["session_id"], c["args"]) if c else None
+        print(f"{where:<14} {c['account'] if c else '(shell)':<8} {e['cwd']}" + (f"\n  {cmd}" if cmd else ""))
+        if a.dry_run:
+            continue
+        if e["session"] in live_sessions:
+            tmux("new-window", "-d", "-t", f'{e["session"]}:{e["window"]}', "-c", e["cwd"])
+        else:
+            tmux("new-session", "-d", "-s", e["session"], "-c", e["cwd"])
+            live_sessions.add(e["session"])
+        if cmd:
+            tmux("send-keys", "-t", where, "-l", cmd)
+            tmux("send-keys", "-t", where, "Enter")
+            # same account and folder as before the reboot, so its trust answer still stands
+            print("  up" if wait_started(where, trust_ok=True) else f"  WARNING: not up yet; check `tmux attach -t {e['session']}`")
+    if not a.dry_run:
+        write_state({**load_state(), "boot_id": boot_id()})
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("ls").set_defaults(f=cmd_ls)
+    s = sub.add_parser("switch", help="move Claude sessions to another account")
+    s.add_argument("sessions", nargs="*", help="tmux session names")
+    s.add_argument("--to", required=True, help="target account name")
+    s.add_argument("--limited", action="store_true",
+                   help="every session on an account that hit its usage limit")
+    s.add_argument("--say", help="message to send once resumed, e.g. 'continue'")
+    s.add_argument("--force", action="store_true", help="interrupt sessions that are mid-turn")
+    s.add_argument("-n", "--dry-run", action="store_true")
+    s.set_defaults(f=cmd_switch)
+    s = sub.add_parser("save")
+    s.add_argument("-q", "--quiet", action="store_true")
+    s.set_defaults(f=cmd_save)
+    s = sub.add_parser("restore")
+    s.add_argument("-n", "--dry-run", action="store_true")
+    s.set_defaults(f=cmd_restore)
+    a = p.parse_args()
+    if a.cmd == "switch" and not (a.sessions or a.limited):
+        p.error("switch: name tmux sessions or pass --limited")
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()
