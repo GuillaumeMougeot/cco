@@ -217,6 +217,47 @@ def test_save_after_reboot_keeps_the_snapshot_until_restore(
     assert state.save([pane("new")]).startswith("saved 1")
 
 
+def test_a_crashed_session_stays_until_restored_or_forgotten(
+    home: Path, fake_tmux: FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state.save([pane("mt"), pane("oca", sid=None)])
+    assert ", 1 gone" in state.save([pane("oca", sid=None)])
+    gone = [e for e in state.load()["entries"] if e.get("gone_since")]
+    assert [e["session"] for e in gone] == ["mt"]
+    first = gone[0]["gone_since"]
+    state.save([pane("oca", sid=None)])
+    assert [e["gone_since"] for e in state.load()["entries"] if e["session"] == "mt"] == [first]
+    monkeypatch.setattr(tmux, "wait_started", lambda *a, **k: object())
+    fake_tmux.panes = "oca\t0\t0\t%2\t200\t/work/repo\n"
+    r = CliRunner().invoke(cli.app, ["restore", "mt"])
+    assert r.exit_code == 0, r.output
+    assert ("new-session", "-d", "-s", "mt", "-c", "/work/repo") in fake_tmux.calls
+    assert ("new-session", "-d", "-s", "oca", "-c", "/work/repo") not in fake_tmux.calls
+    assert state.forget(["mt", "nope"]) == ["nope"]
+    assert [e["session"] for e in state.load()["entries"]] == ["oca"]
+
+
+def test_an_exited_claude_is_remembered_and_resumed_in_its_pane(
+    home: Path, proc: Callable[..., None], fake_tmux: FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state.save([pane("mt")])
+    state.save([pane("mt", sid=None)])  # Claude exited, the shell stayed
+    (e,) = state.load()["entries"]
+    assert e["exited"] and e["claude"]["session_id"] == SID
+    proc(100, ["-bash"])
+    fake_tmux.panes = "mt\t0\t0\t%1\t100\t/work/repo\n"
+    monkeypatch.setattr(tmux, "wait_started", lambda *a, **k: object())
+    r = CliRunner().invoke(cli.app, ["restore", "mt"])
+    assert r.exit_code == 0, r.output
+    assert fake_tmux.typed() == [f"env -u CLAUDE_CONFIG_DIR claude --resume {SID} --model x"]
+    assert not [c for c in fake_tmux.calls if c[0] == "new-session"]
+
+
+def test_restore_of_an_unknown_session_fails(home: Path, fake_tmux: FakeTmux) -> None:
+    state.save([pane("mt")])
+    assert CliRunner().invoke(cli.app, ["restore", "nope"]).exit_code != 0
+
+
 def test_limits_are_remembered_until_they_reset(home: Path) -> None:
     assert state.limits({"claude2": 2000.0}, now=1000) == {"claude2": 2000.0}
     assert state.limits({}, now=1500) == {"claude2": 2000.0}

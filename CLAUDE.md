@@ -19,6 +19,7 @@ cco tracks the Claude Code sessions running in tmux, moves them between Claude a
 - Accept a folder-trust dialog only if the old account had trusted that folder. Trust is a per-account security decision.
 - `~/.claude` is launched with `CLAUDE_CONFIG_DIR` unset: setting it to `~/.claude` makes Claude read `~/.claude/.claude.json` instead of `~/.claude.json`.
 - The snapshot is per machine and guarded by the boot id. After a reboot, `save` must not overwrite it before `restore` has run.
+- A window missing from tmux stays in the snapshot until `cco forget`: cco can't tell a crash from a window closed on purpose ([journal](docs/journal/2026-11-08-crashed-session.md)).
 - Claude Code's file layout and dialog texts are not a public API. When a Claude Code update breaks cco, journal what changed.
 
 ## How to work

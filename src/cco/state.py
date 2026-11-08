@@ -3,6 +3,10 @@
 ``{"boot_id", "saved_at", "entries": [{session, window, cwd, claude: {...} | null}],
 "limits": {account: reset epoch}}``. The boot id guards the snapshot: after a reboot, `save`
 would overwrite it with whatever little runs so far, so it waits until `restore` has run.
+
+A window that disappears stays in the snapshot, marked ``gone_since``: cco can't tell a crash
+(systemd-oomd kills a whole tmux pane) from a window closed on purpose. `cco forget` drops it.
+A window whose Claude exited keeps its last Claude, marked ``exited``.
 """
 
 from __future__ import annotations
@@ -78,9 +82,25 @@ def save(panes: list[tmux.Pane]) -> str:
         return "snapshot is from before the last reboot; run `cco restore` first"
     if not panes:
         return "no tmux server; snapshot left as is"
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    before = {(e["session"], e["window"]): e for e in load().get("entries", [])}
     rows = entries(panes)
-    update(boot_id=boot_id(), saved_at=time.strftime("%Y-%m-%d %H:%M:%S"), entries=rows)
-    return f"saved {len(rows)} windows to {config.state_path()}"
+    for e in rows:
+        old = before.pop((e["session"], e["window"]), None)
+        if e["claude"] is None and old and old.get("claude"):
+            e["claude"], e["exited"] = old["claude"], True
+    gone = [{**e, "gone_since": e.get("gone_since", now)} for e in before.values()]
+    update(boot_id=boot_id(), saved_at=now, entries=rows + gone)
+    extra = f", {len(gone)} gone" if gone else ""
+    return f"saved {len(rows)} windows{extra} to {config.state_path()}"
+
+
+def forget(sessions: list[str]) -> list[str]:
+    """Drop ``sessions`` from the snapshot; returns the names that were not in it."""
+    snap = load()
+    names = {e["session"] for e in snap.get("entries", [])}
+    update(entries=[e for e in snap.get("entries", []) if e["session"] not in sessions])
+    return sorted(set(sessions) - names)
 
 
 def limits(seen: dict[str, float], now: float | None = None) -> dict[str, float]:

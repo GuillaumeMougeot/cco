@@ -84,6 +84,13 @@ def ls() -> None:
         return
     if state.stale():
         say("snapshot is from before the last reboot: `cco restore` brings those sessions back")
+    else:
+        for e in state.load().get("entries", []):
+            if e.get("gone_since"):
+                say(
+                    f"{e['session']}:{e['window']} gone since {e['gone_since']}: "
+                    f"`cco restore {e['session']}` or `cco forget {e['session']}`"
+                )
     infos = {p.pane_id: _info(p.claude) for p in panes if p.claude}
     limits = _limits(panes, infos)
     for account, reset in sorted(limits.items()):
@@ -225,29 +232,60 @@ def _boot_env() -> None:
 
 @app.command()
 def restore(
+    sessions: Annotated[
+        list[str] | None, typer.Argument(help="tmux session names; default: every missing one.")
+    ] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run", "-n", help="Only show the plan.")] = False,
     boot: Annotated[bool, typer.Option("--boot", help="Run by cron at boot.")] = False,
 ) -> None:
-    """Recreate the snapshot's missing tmux windows and resume each Claude in them."""
+    """Recreate the snapshot's missing tmux windows and resume each Claude in them.
+
+    Named sessions also get their Claude back in a window that still exists but whose Claude
+    exited."""
     if boot:
         _boot_env()
     snap = state.load()
     if "entries" not in snap:
         raise CcoError(f"no snapshot at {config.state_path()}")
+    entries = snap["entries"]
+    if sessions:
+        unknown = set(sessions) - {e["session"] for e in entries}
+        if unknown:
+            raise CcoError(f"not in the snapshot: {', '.join(sorted(unknown))}; `cco ls`")
+        entries = [e for e in entries if e["session"] in sessions]
     say(f"snapshot from {snap.get('saved_at')}")
-    live = {(p.session, p.window) for p in tmux.panes()}
+    live = {(p.session, p.window): p for p in tmux.panes() if p.index == 0}
     live_sessions = {s for s, _ in live}
-    for e in snap["entries"]:
-        if (e["session"], e["window"]) in live:
-            continue
-        _restore_one(e, live_sessions, dry_run)
+    done = 0
+    for e in entries:
+        pane = live.get((e["session"], e["window"]))
+        if pane is None:
+            _restore_one(e, live_sessions, dry_run)
+            done += 1
+        elif sessions and e["claude"] and pane.claude is None:
+            _relaunch(e, pane, dry_run)
+            done += 1
+    if not done:
+        say("nothing to restore: every window in the snapshot is running")
     if not dry_run:
         state.update(boot_id=state.boot_id())
+        state.save(tmux.panes())
+
+
+def _launch(e: dict[str, Any]) -> str | None:
+    c = e["claude"]
+    return claude.launch_cmd(Path(c["config_dir"]), c["session_id"], c["args"]) if c else None
+
+
+def _start_claude(target: str, cmd: str, session: str) -> None:
+    tmux.type_line(target, cmd)
+    # Same account and folder as before, so its trust answer still stands.
+    ok = tmux.wait_started(target, trust_ok=True)
+    say("  up" if ok else f"  WARNING: not up after 90 s; `tmux attach -t {session}`")
 
 
 def _restore_one(e: dict[str, Any], live_sessions: set[str], dry_run: bool) -> None:
-    c, where = e["claude"], f"{e['session']}:{e['window']}"
-    cmd = claude.launch_cmd(Path(c["config_dir"]), c["session_id"], c["args"]) if c else None
+    c, where, cmd = e["claude"], f"{e['session']}:{e['window']}", _launch(e)
     say(f"{where:<14} {c['account'] if c else 'shell':<8} {e['cwd']}")
     if cmd:
         say(f"  {cmd}")
@@ -259,10 +297,29 @@ def _restore_one(e: dict[str, Any], live_sessions: set[str], dry_run: bool) -> N
         tmux.run("new-session", "-d", "-s", e["session"], "-c", e["cwd"])
         live_sessions.add(e["session"])
     if cmd:
-        tmux.type_line(where, cmd)
-        # Same account and folder as before, so its trust answer still stands.
-        ok = tmux.wait_started(where, trust_ok=True)
-        say("  up" if ok else f"  WARNING: not up after 90 s; `tmux attach -t {e['session']}`")
+        _start_claude(where, cmd, e["session"])
+
+
+def _relaunch(e: dict[str, Any], pane: tmux.Pane, dry_run: bool) -> None:
+    cmd = _launch(e)
+    assert cmd
+    say(f"{pane.where:<14} {e['claude']['account']:<8} Claude exited; resuming it in the pane")
+    say(f"  {cmd}")
+    if not dry_run:
+        _start_claude(pane.pane_id, cmd, e["session"])
+
+
+@app.command()
+def forget(
+    sessions: Annotated[list[str], typer.Argument(help="tmux session names.")],
+) -> None:
+    """Drop sessions from the snapshot, so `cco restore` no longer brings them back."""
+    unknown = state.forget(sessions)
+    if unknown:
+        say(f"not in the snapshot: {', '.join(unknown)}")
+    live = {p.session for p in tmux.panes()} & set(sessions)
+    if live:
+        say(f"still running, so the next snapshot adds them back: {', '.join(sorted(live))}")
 
 
 def _cco_path() -> str:

@@ -15,7 +15,8 @@ The installer runs `cco setup`, which names your accounts and asks whether sessi
 | `cco switch --limited --to claude` | move every session whose account is out of usage |
 | `cco switch mt --to claude --say continue` | and send a message once resumed |
 | `cco save` | snapshot the tmux windows and their Claude sessions (cron does it every 2 min) |
-| `cco restore [-n]` | recreate missing tmux windows and resume each Claude (at boot, if setup said so) |
+| `cco restore [SESSION...] [-n]` | recreate missing tmux windows and resume each Claude (at boot, if setup said so) |
+| `cco forget SESSION...` | drop a session you closed on purpose, so restore leaves it alone |
 | `cco setup` | rename accounts, turn restore at boot on or off |
 
 An account is a Claude config dir: `~/.claude` (launched with `CLAUDE_CONFIG_DIR` unset) or any other dir, such as `~/.claude-work` behind `alias claude2='CLAUDE_CONFIG_DIR=~/.claude-work claude'`. Setup finds them and takes names from such aliases. They are saved in `~/.config/cco/config.json`.
